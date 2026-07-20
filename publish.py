@@ -10,7 +10,7 @@
 import os
 import shutil
 from dotenv import load_dotenv
-from github import Github
+from github import Github, Auth
 from notion_client import Client
 from notion_to_markdown import MarkdownProvider
 
@@ -29,10 +29,13 @@ def extract_property_value(prop):
     return "Untitled"
 
 def publish_journal_entries():
-    # Initialize clients
+    # Initialize Notion clients
     notion = Client(auth=os.environ["NOTION_TOKEN"])
     n2m = MarkdownProvider(notion)
-    github_client = Github(os.environ["GITHUB_TOKEN"])
+    
+    # Initialize GitHub client 
+    auth = Auth.Token(os.environ["GITHUB_TOKEN"])
+    github_client = Github(auth=auth)
 
     db_id = os.environ["NOTION_DATABASE_ID"]
     repo_name = os.environ["GITHUB_REPO"]
@@ -42,13 +45,18 @@ def publish_journal_entries():
     staging_dir = "staging"
     os.makedirs(staging_dir, exist_ok=True)
     
-    print("Querying Notion database for pending uploads...")
+    print("Querying Notion database for pending (unchecked) uploads...")
     
-    response = notion.databases.query(
-        database_id=db_id,
+    # 1. Retrieve the Database to find its underlying Data Source ID
+    db_info = notion.databases.retrieve(database_id=db_id)
+    data_source_id = db_info["data_sources"][0]["id"]
+    
+    # 2. Query the Data Source for UNCHECKED rows
+    response = notion.data_sources.query(
+        data_source_id=data_source_id,
         filter={
             "property": "Uploaded to Github",
-            "checkbox": {"equals": True}
+            "checkbox": {"equals": False} # Logic inverted here
         }
     )
     
@@ -71,24 +79,35 @@ def publish_journal_entries():
         print(f"\nProcessing: '{name}'")
         md_content = n2m.get_markdown_string(page_id)
         
-        # 1. Save to local staging folder
+        # 3. Prevent crash if the Notion page is completely empty
+        if md_content is None:
+            md_content = ""
+            
+        # 4. Save to local staging folder
         local_path = os.path.join(staging_dir, f"{safe_name}.md")
         with open(local_path, "w", encoding="utf-8") as f:
             f.write(md_content)
             
-        # 2. Pause for Review
+        # 5. Pause for Review
         print(f"\n[PAUSED] The file has been staged at: {local_path}")
         user_input = input("Open it in IBM Bob to review and edit. Press [Enter] to approve and upload, or type 's' to skip: ")
         
         if user_input.strip().lower() == 's':
-            print(" -> Skipping upload for this file.")
+            print(" -> Skipping upload for this file. Marking as processed (checking box)...")
+            # Check the box even if we skip, so it doesn't block future runs
+            notion.pages.update(
+                page_id=page_id,
+                properties={
+                    "Uploaded to Github": {"checkbox": True} # Logic inverted here
+                }
+            )
             continue
             
-        # 3. Read the finalized content back (in case you made edits)
+        # 6. Read the finalized content back
         with open(local_path, "r", encoding="utf-8") as f:
             final_md_content = f.read()
         
-        # 4. Construct the dynamic GitHub path and upload
+        # 7. Construct the dynamic GitHub path and upload
         file_path = f"{category}/{course}/{chapter}/{safe_name}.md"
         commit_msg = f"docs: add study notes for {name}"
         
@@ -101,17 +120,18 @@ def publish_journal_entries():
             repo.create_file(file_path, commit_msg, final_md_content)
             print(" -> Status: New file created successfully.")
             
-        # 5. Uncheck the Notion box
+        # 8. Check the Notion box to mark as uploaded
         notion.pages.update(
             page_id=page_id,
             properties={
-                "Uploaded to Github": {"checkbox": False}
+                "Uploaded to Github": {"checkbox": True} # Logic inverted here
             }
         )
-        print(" -> Notion database updated: Checkbox cleared.")
+        print(" -> Notion database updated: Checkbox marked as uploaded.")
         
         # Optional: Delete the staged file after successful upload
-        os.remove(local_path)
+        if os.path.exists(local_path):
+            os.remove(local_path)
 
 if __name__ == "__main__":
     publish_journal_entries()
